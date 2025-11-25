@@ -1,0 +1,142 @@
+name: Deploy Infra
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "terraform/infra/**"
+      - ".github/workflows/terraform_deploy.yml"
+
+  pull_request:
+    paths:
+      - "terraform/infra/**"
+
+  workflow_dispatch:
+    inputs:
+      EC2_Instance:
+        description: "EC2 Instance type"
+        required: false
+        default: "t3.micro"
+      DB_Instance:
+        description: "DB Instance type"
+        required: false
+        default: "db.t3.micro"  
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Remove backend.tf if it exists
+        working-directory: terraform/infra
+        run: |
+          if [ -f backend.tf ]; then
+            echo "Removing backend.tf (old backend config)"
+            rm backend.tf
+          else
+            echo "backend.tf does not exist — nothing to delete"
+          fi   
+
+      - name: Load backend.auto.tfvars
+        id: backend
+        run: |
+          FILE="terraform/infra/backend.auto.tfvars"
+
+          echo "### Backend file content ###"
+          cat $FILE
+
+          REGION=$(grep -E '^[[:space:]]*region[[:space:]]*=' "$FILE" | head -n 1 | awk -F'=' '{print $2}' | tr -d ' "')
+          ROLE=$(grep -E '^[[:space:]]*oidc_role_arn[[:space:]]*=' "$FILE" | head -n 1 | awk -F'=' '{print $2}' | tr -d ' "')
+          BUCKET=$(grep -E '^[[:space:]]*bucket_name[[:space:]]*=' "$FILE" | head -n 1 | awk -F'=' '{print $2}' | tr -d ' "')
+          LOCKTABLE=$(grep -E '^[[:space:]]*lock_table_name[[:space:]]*=' "$FILE" | head -n 1 | awk -F'=' '{print $2}' | tr -d ' "')
+          echo "region=$REGION" >> $GITHUB_OUTPUT
+          echo "role=$ROLE" >> $GITHUB_OUTPUT
+          echo "bucket=$BUCKET" >> $GITHUB_OUTPUT
+          echo "locktable=$LOCKTABLE" >> $GITHUB_OUTPUT
+
+          echo "Loaded values:"
+          echo " - BUCKET=$BUCKET"
+          echo " - REGION=$REGION"
+          echo " - LOCKTABLE=$LOCKTABLE"
+          echo " - ROLE=$ROLE"
+
+      - name: Generate backend.tf
+        working-directory: terraform/infra
+        run: |
+          sed -e "s|\${bucket_name}|${{ steps.backend.outputs.bucket }}|g" \
+              -e "s|\${region}|${{ steps.backend.outputs.region }}|g" \
+              -e "s|\${lock_table_name}|${{ steps.backend.outputs.locktable }}|g" \
+              backend.tf.tpl > backend.tf  
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.backend.outputs.role }}
+          aws-region: ${{ steps.backend.outputs.region }}
+          audience: sts.amazonaws.com
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        working-directory: terraform/infra
+        run: |
+          cat backend.tf
+          terraform init -input=false
+
+      - name: Terraform State List
+        working-directory: terraform/infra
+        run: terraform state list || echo "No state found"
+      
+      - name: Remove leftover backend resources from state
+        working-directory: terraform/infra
+        run: |
+          remove_if_exists() {
+              if terraform state list | grep -q "$1"; then
+              echo "Removing $1 from state..."
+              terraform state rm "$1"
+            else
+              echo "$1 not found in state — skipping"
+            fi
+          }
+
+          remove_if_exists "aws_dynamodb_table.tf_locks"
+          remove_if_exists "aws_s3_bucket.tf_state"
+          remove_if_exists "aws_s3_bucket_versioning.tf_state_versioning"
+          remove_if_exists "aws_s3_bucket_server_side_encryption_configuration.tf_state_encryption"
+
+      - name: Terraform Validate
+        working-directory: terraform/infra
+        run: terraform validate
+
+      - name: Terraform Plan
+        working-directory: terraform/infra
+        run: |
+          terraform plan -input=false
+
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main'
+        working-directory: terraform/infra
+        run: |
+          terraform apply -auto-approve -input=false
+
+      - name: Read EC2 Public IP
+        id: ec2_output
+        working-directory: terraform/infra
+        run: |
+          echo "ec2_ip=$(terraform output -raw app_public_ip)" >> $GITHUB_OUTPUT
+
+      - name: Show deployment URL
+        run: |
+          echo "*************************************"
+          echo "Application is available at:"
+          echo "http://${{ steps.ec2_output.outputs.ec2_ip }}/"
+          echo "*************************************"
+
+  

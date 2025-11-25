@@ -1,0 +1,120 @@
+name: Terraform State
+
+on:
+  workflow_dispatch:
+    inputs:
+      bucket_prefix:
+        description: "Prefix for S3 bucket (must be globally unique)"
+        required: true
+      lock_table_prefix:
+        description: "Prefix for DynamoDB lock table"
+        required: true
+      aws_access_key_id:
+        description: "AWS access key id"
+        required: true
+      aws_secret_access_key:
+        description: "AWS secret access key"
+        required: true
+      aws_region:
+        description: AWS region
+        required: false
+        default: "eu-central-1"
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ github.event.inputs.aws_access_key_id }}
+          aws-secret-access-key: ${{ github.event.inputs.aws_secret_access_key }}
+          aws-region: ${{ github.event.inputs.aws_region }}
+      
+      - name: Remove backend.tf if it exists
+        working-directory: terraform/backend
+        run: |
+          if [ -f backend.tf ]; then
+            echo "Removing backend.tf (old backend config)"
+            rm backend.tf
+          else
+            echo "backend.tf does not exist — nothing to delete"
+          fi
+       
+      - name: Remove backend.auto.tfvars if it exists
+        working-directory: terraform/infra
+        run: |
+          if [ -f backend.auto.tfvars ]; then
+            echo "Removing old backend.auto.tfvars"
+            rm backend.auto.tfvars
+          else
+            echo "backend.auto.tfvars does not exist, skipping"
+          fi   
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init (local state)
+        working-directory: terraform/backend
+        run: terraform init
+
+      - name: Terraform Apply (create bucket & lock table)
+        working-directory: terraform/backend
+        run: |
+          terraform apply -auto-approve \
+            -var="bucket_prefix=${{ github.event.inputs.bucket_prefix }}" \
+            -var="lock_table_prefix=${{ github.event.inputs.lock_table_prefix }}" \
+            -var="region=${{ github.event.inputs.aws_region }}"
+
+      - name: Read Outputs
+        id: out
+        working-directory: terraform/backend
+        run: |
+          echo "bucket_name=$(terraform output -raw bucket_name)" >> $GITHUB_OUTPUT
+          echo "lock_table_name=$(terraform output -raw lock_table_name)" >> $GITHUB_OUTPUT
+          echo "region=$(terraform output -raw region)" >> $GITHUB_OUTPUT
+
+      - name: Write backend.tf
+        working-directory: terraform/backend
+        run: |
+          cat > backend.tf <<EOF
+          terraform {
+          backend "s3" {
+          bucket         = "${{ steps.out.outputs.bucket_name }}"
+          key            = "backend/terraform.tfstate"
+          region         = "${{ steps.out.outputs.region }}"
+          dynamodb_table = "${{ steps.out.outputs.lock_table_name }}"
+          encrypt        = true
+            }
+          }
+          EOF
+      
+      - name: Terraform Init (migrate to S3 backend)
+        working-directory: terraform/backend
+        run: terraform init -migrate-state -force-copy
+    
+
+      - name: Create backend.auto.tfvars for infra
+        run: |
+          mkdir -p terraform/infra
+          cat > terraform/infra/backend.auto.tfvars <<EOF
+          bucket_name      = "${{ steps.out.outputs.bucket_name }}"
+          lock_table_name  = "${{ steps.out.outputs.lock_table_name }}"
+          region           = "${{ steps.out.outputs.region }}"
+          EOF
+      
+      - name: Commit backend files
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add -f terraform/infra/backend.auto.tfvars
+          git commit -m "backend.auto.tfvars"
+          git push    
+          

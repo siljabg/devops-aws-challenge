@@ -1,0 +1,19 @@
+# General
+.idea/
+.vscode/
+.DS_Store
+*.log
+*.tmp
+
+# Terraform
+!terraform/infra/backend.auto.tfvars
+**/.terraform/*
+**/.terraform.lock.hcl
+terraform.tfvars
+*.tfvars
+terraform.tfstate
+terraform.tfstate.*
+crash.log
+override.tf
+override.tf.json
+terraform.rc

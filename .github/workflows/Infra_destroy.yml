@@ -1,0 +1,92 @@
+name: Destroy Infra
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_destroy:
+        type: choice
+        description: "Are you SURE you want to DESTROY ALL AWS RESOURCES?"
+        required: true
+        default: "NO"
+        options:
+          - "NO"
+          - "YES"
+
+jobs:
+  terraform-destroy:
+    runs-on: ubuntu-latest
+
+    if: ${{ github.event.inputs.confirm_destroy == 'YES' }}
+
+    defaults:
+      run:
+        working-directory: terraform/infra
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Remove backend.tf if it exists
+        working-directory: terraform/infra
+        run: |
+          if [ -f backend.tf ]; then
+            echo "Removing backend.tf (old backend config)"
+            rm backend.tf
+          else
+            echo "backend.tf does not exist — nothing to delete"
+          fi   
+
+      - name: Load backend.auto.tfvars
+        working-directory: terraform/infra
+        id: backend
+        run: |
+          FILE="backend.auto.tfvars"
+
+          echo "### Backend file content ###"
+          cat $FILE
+
+          REGION=$(grep -E '^[[:space:]]*region[[:space:]]*=' "$FILE" | head -n 1 | awk -F'=' '{print $2}' | tr -d ' "')
+          ROLE=$(grep -E '^[[:space:]]*oidc_role_arn[[:space:]]*=' "$FILE" | head -n 1 | awk -F'=' '{print $2}' | tr -d ' "')
+          BUCKET=$(grep -E '^[[:space:]]*bucket_name[[:space:]]*=' "$FILE" | head -n 1 | awk -F'=' '{print $2}' | tr -d ' "')
+          LOCKTABLE=$(grep -E '^[[:space:]]*lock_table_name[[:space:]]*=' "$FILE" | head -n 1 | awk -F'=' '{print $2}' | tr -d ' "')
+          echo "region=$REGION" >> $GITHUB_OUTPUT
+          echo "role=$ROLE" >> $GITHUB_OUTPUT
+          echo "bucket=$BUCKET" >> $GITHUB_OUTPUT
+          echo "locktable=$LOCKTABLE" >> $GITHUB_OUTPUT
+
+          echo "Loaded values:"
+          echo " - BUCKET=$BUCKET"
+          echo " - REGION=$REGION"
+          echo " - LOCKTABLE=$LOCKTABLE"
+          echo " - ROLE=$ROLE"
+
+      - name: Generate backend.tf
+        working-directory: terraform/infra
+        run: |
+          sed -e "s|\${bucket_name}|${{ steps.backend.outputs.bucket }}|g" \
+              -e "s|\${region}|${{ steps.backend.outputs.region }}|g" \
+              -e "s|\${lock_table_name}|${{ steps.backend.outputs.locktable }}|g" \
+              backend.tf.tpl > backend.tf 
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.backend.outputs.role }}
+          aws-region: ${{ steps.backend.outputs.region }}
+          audience: sts.amazonaws.com
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Terraform Refresh
+        run: terraform refresh -input=false
+
+      - name: Terraform Destroy
+        run: terraform destroy -auto-approve -input=false

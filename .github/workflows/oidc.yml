@@ -1,0 +1,105 @@
+name: OIDC
+
+on:
+  workflow_dispatch:
+    inputs:
+      aws_access_key_id:
+        required: true
+        description: "AWS Access Key ID"
+      aws_secret_access_key:
+        required: true
+        description: "AWS Secret Access Key"
+
+permissions:
+  contents: write
+  id-token: write
+
+env:
+  TF_VAR_github_repo: ${{ github.repository }}
+
+jobs:
+  oidc-setup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+  
+      - name: Load bootstrap credentials
+        id: backend
+        run: |
+          FILE="terraform/infra/backend.auto.tfvars"
+          cat "$FILE"
+
+          sed -n 'l' terraform/infra/backend.auto.tfvars
+
+          REGION=$(grep -E '^[[:space:]]*region[[:space:]]*=' "$FILE" | awk -F'=' '{print $2}' | tr -d ' "')
+          BUCKET=$(grep -E '^[[:space:]]*bucket_name[[:space:]]*=' "$FILE" | awk -F'=' '{print $2}' | tr -d ' "')
+          LOCKTABLE=$(grep -E '^[[:space:]]*lock_table_name[[:space:]]*=' "$FILE" | awk -F'=' '{print $2}' | tr -d ' "')
+
+          echo "region=$REGION" >> $GITHUB_OUTPUT
+          echo "bucket_name=$BUCKET" >> $GITHUB_OUTPUT
+          echo "lock_table_name=$LOCKTABLE" >> $GITHUB_OUTPUT
+
+          echo "Loaded values:"
+          echo " - REGION: $REGION"
+          echo " - BUCKET_NAME: $BUCKET"
+          echo " - LOCK_TABLE_NAME: $LOCKTABLE"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ github.event.inputs.aws_access_key_id }}
+          aws-secret-access-key: ${{ github.event.inputs.aws_secret_access_key }}
+          aws-region: ${{ steps.backend.outputs.region }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        working-directory: terraform/oidc
+        run: terraform init
+
+      - name: Terraform Apply OIDC
+        id: apply_oidc
+        working-directory: terraform/oidc
+        run: |
+          terraform apply -auto-approve \
+            -var="aws_region=${{ steps.backend.outputs.region }}" \
+            -var="bucket_name=${{ steps.backend.outputs.bucket_name }}" \
+            -var="lock_table_name=${{ steps.backend.outputs.lock_table_name }}"
+
+      - name: Read OIDC Outputs
+        id: oidc_output
+        working-directory: terraform/oidc
+        run: |
+          echo "role_arn=$(terraform output -raw role_arn)" >> $GITHUB_OUTPUT
+
+      - name: Remove oidc_role_arn from backend.auto.tfvars if exists
+        run: |
+          FILE="terraform/infra/backend.auto.tfvars"
+
+          if [ -f "$FILE" ]; then
+            if grep -q "oidc_role_arn" "$FILE"; then
+              sed -i '/oidc_role_arn/d' "$FILE"
+              echo "Removed old oidc_role_arn"
+            else
+              echo "oidc_role_arn not found"
+            fi
+          else
+            echo "backend.auto.tfvars does not exist — skipping."
+          fi
+
+      - name: Update backend.auto.tfvars with role ARN
+        run: |
+          echo "" >> terraform/infra/backend.auto.tfvars
+          echo "oidc_role_arn = \"${{ steps.oidc_output.outputs.role_arn }}\"" >> terraform/infra/backend.auto.tfvars
+          echo "Updated backend.auto.tfvars with new role ARN"
+
+      - name: Commit updates
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add -f terraform/infra/backend.auto.tfvars
+          git commit -m "Added OIDC role ARN"
+          git push
