@@ -37,46 +37,46 @@ Each module is applied independently.
 
 == 1. Prerequisites IAM user permissions
 
-To bootstrap the backend and OIDC module, the user must have an AWS IAM user with these permissions.
+To bootstrap the Terraform backend (S3 + DynamoDB) and the GitHub OIDC module, the user must temporarily have broad IAM permissions.
+This is required because the AWS Terraform provider performs many implicit read operations (Get*, List*, Describe*) across IAM, S3, and DynamoDB, which are not explicitly declared in the provider documentation but are necessary during resource creation.
+Although Terraform creates only a few IAM, S3, and DynamoDB resources, AWS internally calls many APIs.
 
-=== IAM (required for OIDC creation)
+=== Required bootstrap permissions
 [source]
 ----
-iam:CreateOpenIDConnectProvider
-iam:DeleteOpenIDConnectProvider
-iam:CreateRole
-iam:DeleteRole
-iam:UpdateAssumeRolePolicy
-iam:CreatePolicy
-iam:DeletePolicy
-iam:AttachRolePolicy
-iam:DetachRolePolicy
-----
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["iam:*"],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:*"],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["dynamodb:*"],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "sts:GetCallerIdentity",
+        "ec2:Describe*"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
 
-=== S3 and DynamoDB (for Terraform backend)
-[source]
+NOTE:
+These permissions are required only during bootstrap.
+After the backend and OIDC provider are created, they should be replaced with minimal, least-privilege IAM roles used by GitHub Actions through OIDC.
 ----
-s3:CreateBucket
-s3:PutBucketVersioning
-s3:PutBucketEncryption
-s3:PutBucketPublicAccessBlock
-s3:PutBucketPolicy
-s3:GetBucketLocation
-s3:ListBucket
-s3:DeleteBucket
-
-dynamodb:CreateTable
-dynamodb:DescribeTable
-dynamodb:DeleteTable
-----
-
-=== General AWS permissions
-[source]
-----
-sts:GetCallerIdentity
-ec2:Describe*
-----
-
 ---
 
 == 2. Deployment Steps using GitHub Actions
